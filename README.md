@@ -4,6 +4,8 @@ A local, voice-driven assistant for your PC. Speak into the microphone; the app 
 
 This repository is intended to be **open source**. You are welcome to use it, change it, and share it under the license you add to the project (e.g. MIT). Do **not** commit API keys or personal secrets; use environment files that stay on your machine (see below).
 
+**GitHub:** [github.com/HunterisLive-1/jarvis](https://github.com/HunterisLive-1/jarvis) — clone URL: `https://github.com/HunterisLive-1/jarvis.git`
+
 ---
 
 ## What you get
@@ -38,8 +40,8 @@ This repository is intended to be **open source**. You are welcome to use it, ch
 ### 1. Clone and enter the project
 
 ```bash
-git clone <your-repo-url>
-cd livrkit
+git clone https://github.com/HunterisLive-1/jarvis.git
+cd jarvis
 ```
 
 ### 2. Install dependencies
@@ -244,7 +246,7 @@ uv run phone_adb_control.py wireless --port 5555
 | `session_memory.py` | Short rolling memory for tool results |
 | `phone_adb_control.py` | Optional CLI for ADB without the voice app |
 | `scripts/fetch_platform_tools.py` | Download Android platform-tools into `platform-tools/` |
-| `pyproject.toml` / `uv.lock` | Dependencies (package name in metadata may differ from the marketing name above) |
+| `pyproject.toml` / `uv.lock` | Dependencies; PyPI-style name is `livrkit-agent`, while the GitHub repo is [**HunterisLive-1/jarvis**](https://github.com/HunterisLive-1/jarvis) |
 
 ---
 
@@ -252,7 +254,7 @@ uv run phone_adb_control.py wireless --port 5555
 
 Contributions, issues, and pull requests are welcome. Suggested first steps for contributors:
 
-1. Fork the repository and create a branch for your change.
+1. Fork [HunterisLive-1/jarvis](https://github.com/HunterisLive-1/jarvis) and create a branch for your change.
 2. Run the app with `uv run local_jarvis.py` and, if you change tools, test with `JARVIS_LLM=gemini` and tools enabled.
 3. Do not commit secrets; use `.env.local` locally.
 4. Add a **LICENSE** file (e.g. MIT) if the maintainer has not already done so, and state it clearly in the repo.
@@ -265,7 +267,7 @@ Contributions, issues, and pull requests are welcome. Suggested first steps for 
 
 Thanks to the open-source projects this stack builds on, including [Google Gemini](https://ai.google.dev/), [Ollama](https://ollama.com/), [Vosk](https://alphacephei.com/vosk/), [Edge TTS](https://github.com/rany2/edge-tts), [ddgs](https://github.com/deedy5/duckduckgo_search), and the broader Python ecosystem.
 
-If this project helps you, consider starring the repository and sharing feedback.
+If this project helps you, consider [starring the repository on GitHub](https://github.com/HunterisLive-1/jarvis) and sharing feedback.
 
 ---
 
