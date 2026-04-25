@@ -15,3 +15,6 @@ wheels/
 
 # Fetched on demand (see scripts/fetch_platform_tools.py)
 platform-tools/
+
+# Local only (not for GitHub)
+a.md
