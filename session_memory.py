@@ -3,10 +3,10 @@ Lightweight, in-RAM "scratchpad" for the current :class:`~local_jarvis.Jarvis` r
 Destroyed when the process exits or you say **reset session** / **clear session** (clears scratchpad and chat).
 
 * Not persisted to disk.
-* Short rolling notes (default cap from ``JARVIS_SESSION_MAX_NOTES``), e.g. last ADB tool result.
-* Injected as a suffix on the system instruction so Gemini keeps context across long flows.
+* Short rolling notes (default cap from ``JARVIS_SESSION_MAX_NOTES``), e.g. one-line tool summaries.
+* Injected as a suffix on the system instruction so the model keeps context across long flows.
 
-Phone tools should call :func:`note_tool_result` so the next model turn sees a one-line tool summary.
+Call :func:`note_tool_result` from tool code if you need the next turn to see a one-line tool summary.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class SessionMemory:
         return (
             "\n\n**Session memory (in RAM for this run only, cleared on exit or 'reset session'):**\n"
             f"{body}\n"
-            "Use this to stay consistent: quote SUCCESS/FAILED from tool lines, and remember device/ADB state."
+            "Use this to stay consistent with recent tool outcomes when relevant."
         )
 
 

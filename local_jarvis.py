@@ -1,21 +1,13 @@
 """
-Local voice assistant: microphone -> STT -> LLM -> Edge TTS -> speakers.
+Local voice assistant: microphone -> faster-whisper (STT) -> Ollama (LLM + tools) -> Edge TTS.
 
-STT (JARVIS_STT):
-  - gemini   — Google Gemini transcribes audio (fast on network; needs GOOGLE_API_KEY). Best "instant" feel without local GPU.
-  - vosk     — Local, very fast CPU; download a model and set JARVIS_VOSK_MODEL.
-  - whisper  — Local; needs: uv sync --extra whisper  (heavy torch install).
-
-LLM (JARVIS_LLM):
-  - gemini   — Needs GOOGLE_API_KEY; use JARVIS_GEMINI_MODEL (default: gemini-2.0-flash).
-  - ollama   — Local; needs ollama serve + pulled model.
+**Stack (fully local, low latency):** STT uses `faster-whisper` (JARVIS_FW_*), LLM uses **Ollama** with tool calling
+(JARVIS_OLLAMA_MODEL, default `qwen2.5:3b`), TTS is **Edge**. Run `ollama serve` and `ollama pull` your model.
 
 TTS: Edge (Microsoft). **Spoken replies are English by default** (JARVIS_TTS_LANG=en). Optional
-  `JARVIS_EDGE_VOICE_AR` if the model ever returns Arabic script. **Bundled ADB**: run
-  `uv run python scripts/fetch_platform_tools.py` then `platform-tools/adb.exe` is used automatically.
-  Optional: JARVIS_WORLD_NEWS_URL, JARVIS_ENABLE_PHONE_TOOLS=0.
+  `JARVIS_EDGE_VOICE_AR` if the model ever returns Arabic script. Optional: JARVIS_WORLD_NEWS_URL.
   Prosody: JARVIS_EDGE_RATE / JARVIS_EDGE_PITCH / JARVIS_EDGE_VOLUME.
-  **Context**: JARVIS_MAX_TURNS (default 12) trims chat; **Session memory** (in RAM) holds short tool/ADB notes
+  **Context**: JARVIS_MAX_TURNS (default 12) trims chat; **Session memory** (in RAM) holds short tool notes
   for this run (JARVIS_SESSION_MAX_NOTES). Say **reset session** to clear. Destroyed on process exit.
   **Wake on clap** (JARVIS_WAKE_ON_CLAP=1): wait for clap (optionally JARVIS_CLAP_STRIKES=2 double-clap), then
   normal listening. **JARVIS_CLAP_STICKY_SESSION=1** (default): after waking, keep listening for more commands
@@ -24,8 +16,9 @@ TTS: Edge (Microsoft). **Spoken replies are English by default** (JARVIS_TTS_LAN
   (or similar) when in sticky clap mode to rest until the next wake. JARVIS_CLAP_REWAKE_EN: short line on each
   re-wake after the first; JARVIS_WELCOME_EN is spoken the first time you clap in sticky mode.
 
-Welcome: JARVIS_WELCOME_EN. Replies: English TTS; multilingual STT (e.g. Hindi in Devanagari) should be answered in English
-  without repeated "English only" preambles (see default JARVIS_SYSTEM).
+Welcome: JARVIS_WELCOME_EN. Replies: English TTS; STT is English (base.en) by default.
+**Coding lab:** say **set up my lab** / **prepare my coding environment** (and optional path or a name) to
+create a project folder, optional `.venv`, and open **VS Code** with **no LLM** (JARVIS_LAB_* in `.env.local`).
 **Banner:** On startup the terminal prints an ASCII JARVIS logo (figlet-style). JARVIS_SHOW_BANNER=0 to hide;
 JARVIS_ASCII_STYLE=standard for block “JARVIS” letters, or slant (default) for the lean logo.
 **Clap:** Impulses are short: detection uses **peak** as well as RMS (JARVIS_CLAP_PEAK_ATTACK). Defaults are fairly
@@ -38,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import inspect
 import json
 import logging
 import os
@@ -45,27 +39,53 @@ import re
 import sys
 import tempfile
 import time
+import warnings
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import edge_tts
 import numpy as np
 import ollama
+# pygame pulls setuptools/pkg_resources; suppress that deprecation noise on import.
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API",
+    category=UserWarning,
+    module="pygame.pkgdata",
+)
 import pygame
 import sounddevice as sd
 
 # Optional env file
 _ROOT = Path(__file__).resolve().parent
+
+
+def _parse_env_file_value(raw: str) -> str:
+    """
+    Unquote or strip a value from a line like KEY=value.
+    Trailing inline comments (unquoted) are removed:  base.en  # options -> base.en
+    """
+    s = raw.strip()
+    if not s:
+        return s
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return re.sub(r"\s+#.*$", "", s).strip()
+
+
 for _p in (_ROOT / ".env.local", _ROOT / ".env"):
     if _p.is_file():
         for line in _p.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 k, _, v = line.partition("=")
-                k, v = k.strip(), v.strip().strip('"').strip("'")
+                k, v = k.strip(), _parse_env_file_value(v)
                 if k and k not in os.environ:
                     os.environ[k] = v
+
+# Hugging Face Hub: Windows often lacks symlink support; avoid a long console warning.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 logger = logging.getLogger("local_jarvis")
 
@@ -153,7 +173,7 @@ def _print_jarvis_banner() -> None:
     )
     oa, ra, ob, rb = _banner_ansi()
     print(f"{oa}{art}{ra}", end="", flush=True)
-    line = "  | local voice assistant | mic -> STT -> LLM -> Edge TTS"
+    line = "  | local voice assistant | faster-whisper → Ollama → Edge TTS"
     if ob:
         line = f"{ob}{line}{rb}"
     print(line + "\n", flush=True)
@@ -275,23 +295,17 @@ def _clack_ack_beep() -> None:
         except (ImportError, RuntimeError, OSError):
             pass
 
-# --- STT / LLM selection (see module docstring) ---
-_HAS_GEMINI_KEY = bool(os.environ.get("GOOGLE_API_KEY"))
-STT_MODE = os.environ.get(
-    "JARVIS_STT",
-    "gemini" if _HAS_GEMINI_KEY else "vosk",
-)
-LLM_MODE = os.environ.get(
-    "JARVIS_LLM",
-    "gemini" if _HAS_GEMINI_KEY else "ollama",
-)
+# ── Model config ──
+FW_MODEL_SIZE = os.environ.get("JARVIS_FW_MODEL", "base.en")  # faster-whisper model
+FW_DEVICE = os.environ.get("JARVIS_FW_DEVICE", "cuda")  # "cuda" or "cpu"
+FW_COMPUTE = os.environ.get("JARVIS_FW_COMPUTE", "float16")  # "float16" or "int8" (GPU)
+# Used when falling back to CPU after a failed CUDA inference (or if JARVIS_FW_DEVICE=cpu)
+FW_COMPUTE_CPU = os.environ.get("JARVIS_FW_COMPUTE_CPU", "int8")
+OLLAMA_MODEL = os.environ.get("JARVIS_OLLAMA_MODEL", "qwen2.5:3b")
+MAX_TOOL_ROUNDS = 5  # agentic loop max iterations
 
-WHISPER_SIZE = os.environ.get("JARVIS_WHISPER", "tiny")
-OLLAMA_MODEL = os.environ.get("JARVIS_OLLAMA_MODEL", "llama3.2:3b")
-GEMINI_MODEL = os.environ.get("JARVIS_GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_STT_MODEL = os.environ.get("JARVIS_GEMINI_STT_MODEL", GEMINI_MODEL)
-
-EDGE_VOICE = os.environ.get("JARVIS_EDGE_VOICE", "en-GB-RyanNeural")
+# Default: Thomas = measured UK male, closer to a calm “house AI” (film Jarvis) than Ryan.
+EDGE_VOICE = os.environ.get("JARVIS_EDGE_VOICE", "en-GB-ThomasNeural")
 # Optional: only if JARVIS_TTS_LANG=ar or auto with Arabic in the reply text
 EDGE_VOICE_AR = os.environ.get("JARVIS_EDGE_VOICE_AR", "fa-IR-FaridNeural")
 # en (default): spoken output always uses JARVIS_EDGE_VOICE. "ar"/"auto" see pick_edge_voice.
@@ -299,44 +313,35 @@ JARVIS_TTS_LANG = os.environ.get("JARVIS_TTS_LANG", "en").lower()
 
 # Edge TTS prosody (SSML): faster rate + slightly higher pitch = snappier “house AI / Jarvis” read.
 # Formats: rate/volume "±N%", pitch "±NHz" (see edge-tts TTSConfig validation).
-JARVIS_EDGE_RATE = os.environ.get("JARVIS_EDGE_RATE", "+20%")
-JARVIS_EDGE_PITCH = os.environ.get("JARVIS_EDGE_PITCH", "+6Hz")
+JARVIS_EDGE_RATE = os.environ.get("JARVIS_EDGE_RATE", "+10%")
+JARVIS_EDGE_PITCH = os.environ.get("JARVIS_EDGE_PITCH", "+2Hz")
 JARVIS_EDGE_VOLUME = os.environ.get("JARVIS_EDGE_VOLUME", "+0%")
+# Synthesize the full reply in one Edge request when length ≤ this (avoids long pauses
+# between per-sentence HTTP round-trips). Set lower only if a single request fails.
+JARVIS_TTS_SINGLE_MAX_CHARS = int(
+    os.environ.get("JARVIS_TTS_SINGLE_MAX_CHARS", "4000")
+)
 
 # Arabic script: optional alternate Edge voice (only when JARVIS_TTS_LANG allows)
 _ARABIC_SCRIPT = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
 
-
-def _adb_status_line() -> str:
-    """Log which adb binary will be used (bundled in project, PATH, or ADB_PATH)."""
-    try:
-        from android_adb import adb_executable
-
-        return adb_executable()
-    except Exception as e:  # noqa: BLE001
-        return f"(adb unavailable: {e})"
-
-
 # Default: Jarvis-like house AI. Override with JARVIS_SYSTEM in .env
 _SYSTEM_JARVIS_DEFAULT = (
-    "You are the advanced house AI 'Jarvis' in the spirit of the Iron Man films: precise, unflappable, "
-    "loyal to the user, with light dry humor when it fits. Address the user as 'sir' or 'ma'am' when natural. "
-    "Keep every reply short and speakable (this is a voice interface).\n\n"
-    "**Language:** User speech is often transcribed in **Devanagari** (Hindi), Roman Hinglish, or English. "
-    "This is expected. **Infer intent** and answer in **spoken English** (TTS) only—no Devanagari in *your* text. "
-    "**Never** start with boilerplate about 'I only speak English', 'on this interface', or 'I cannot use Hindi'—it annoys the user. "
-    "Do not apologize for language mismatch; do not claim you 'cannot understand'—you understand; you reply in English. "
-    "Only discuss languages if the user *explicitly* asks how multilingual input works (then one short sentence, no lecture).\n\n"
-    "For **action requests** (YouTube, WhatsApp, phone, news, map, Chrome, etc.): call the **right tool in the same turn** "
-    "and say one short line in English (e.g. opening it now, sir). **Run the tool**; do not only promise to.\n\n"
-    "**No capability tours:** Do not list what you can do, do not add 'I can also help with…' or 'For example I can open…' "
-    "or 'Is there anything else?' with a feature menu. The user already knows. Answer the question, run the tool, or ask "
-    "one concrete follow-up if you truly need it.\n\n"
-    "Follow tool instructions for web, phone, and maps. No markdown, no lists, no emojis. "
-    "If something is genuinely unclear, one short clarifying question is fine."
+    "You are Jarvis, an advanced local AI assistant in the spirit of Iron Man's JARVIS. "
+    "You are precise, fast, and loyal. Address the user as 'sir' when natural. "
+    "Keep every reply SHORT and speakable — this is a real-time voice interface. "
+    "No markdown, no bullet points, no emojis. One or two sentences max unless explaining something complex.\n\n"
+    "Language: Always respond in English only.\n\n"
+    "Tools: You have tools to control the PC, browser, and search the web. "
+    "When the user asks you to DO something (open YouTube, search news, open Chrome, maps, news), "
+    "call the right tool immediately in the same response — do NOT just promise to do it. "
+    "After calling a tool, say one short confirmation line.\n"
+    "For a joke, riddle, or small talk, answer directly; do not call web search for that. "
+    "Use search or news tools only when the user wants live web facts, news, or research.\n\n"
+    "Never list your capabilities unprompted. Never say 'Is there anything else I can help you with?'. "
+    "Just answer and act."
 )
-# Appended to system when Gemini tools (JARVIS_ENABLE_TOOLS) are on
-# Phone paragraph omitted when JARVIS_ENABLE_PHONE_TOOLS=0 (must match which tools are registered)
+# Appended to system: tools and session notes (Ollama + tools always on)
 _SYSTEM_TOOLS_ADDON_CORE = (
     "\n\n**Tools (you must use them when relevant — in any language or script, including Devanagari transcripts):** "
     "You can invoke functions to act for the user. "
@@ -351,34 +356,17 @@ _SYSTEM_TOOLS_ADDON_CORE = (
     "To **fully quit Google Chrome** (all windows, all tabs) when the user says to close Chrome or the browser, call `close_all_google_chrome` immediately — the same as the local voice command. "
     "To move between Chrome tabs: `focus_google_chrome` then `chrome_tab_right` (next) or `chrome_tab_left` (previous). "
 )
-_SYSTEM_TOOLS_ADDON_PHONE = (
-    "**Android phone (USB debugging / ADB on this PC)**: the user is still heard on the **PC mic**; these tools only **control the phone** via adb. "
-    "Use `phone_check_adb_and_devices` if connection is uncertain; read the **Summary** line (unauthorized / no device / ready). "
-    "For wireless adb over Wi-Fi: `phone_enable_wireless_adb` after USB is in; if the phone IP is not auto-detected, the user may set **JARVIS_ADB_WIFI_IP** (phone LAN IP) in the environment. "
-    "When a tool result includes **NEXT:** about YouTube, ask that one question in speech; on agreement, run `phone_youtube_search_and_open` with the query given in the tool text. "
-    "For the phone: `phone_open_whatsapp`, `phone_open_youtube`, `phone_youtube_search_and_open`. "
-    "If WhatsApp fails, use the tool return text (SUCCESS or FAILED) and suggest replug USB or set JARVIS_WHATSAPP_PACKAGE for WhatsApp Business. "
-)
 _SYSTEM_TOOLS_ADDON_FOOT = (
     "If the user only asks a vague 'what can you do' / capabilities question, reply in one short line: offer to help with "
     "their next *specific* request—**do not** enumerate features, tools, or give examples like a product tour. "
     "You may call several tools in one turn, then one concise answer in English. "
-    "**Session memory** (in the system block) lists recent ADB/phone tool lines: trust it; do not claim 'no device' if the last note shows a connected device, unless a fresh `phone_check` says otherwise."
+    "**Session memory** (in the system block) lists recent one-line tool summaries when present—use them for consistency."
 )
 
 
 def _active_system_tools_addon() -> str:
-    s = _SYSTEM_TOOLS_ADDON_CORE
-    if os.environ.get("JARVIS_ENABLE_PHONE_TOOLS", "1").lower() in ("1", "true", "yes"):
-        s += _SYSTEM_TOOLS_ADDON_PHONE
-    return s + _SYSTEM_TOOLS_ADDON_FOOT
+    return _SYSTEM_TOOLS_ADDON_CORE + _SYSTEM_TOOLS_ADDON_FOOT
 SYSTEM_JARVIS = os.environ.get("JARVIS_SYSTEM", _SYSTEM_JARVIS_DEFAULT)
-# 1 = register Jarvis tool functions (Gemini AFC only; requires gemini LLM)
-JARVIS_ENABLE_TOOLS = os.environ.get("JARVIS_ENABLE_TOOLS", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
 # English-only startup line; spoken before any user turn. Override: JARVIS_WELCOME_EN
 WELCOME_EN = os.environ.get(
     "JARVIS_WELCOME_EN",
@@ -387,10 +375,6 @@ WELCOME_EN = os.environ.get(
 )
 # After the first clap-wake, shorter line when re-waking from sleep (sticky clap). Override: JARVIS_CLAP_REWAKE_EN
 CLAP_REWAKE_EN = os.environ.get("JARVIS_CLAP_REWAKE_EN", "At your service, sir.")
-
-# Default Vosk English model path (user downloads and unzips here)
-_DEFAULT_VOSK = _ROOT / "models" / "vosk-model-small-en-us-0.15"
-JARVIS_VOSK_MODEL = os.environ.get("JARVIS_VOSK_MODEL", str(_DEFAULT_VOSK))
 
 
 @dataclass
@@ -627,6 +611,212 @@ def _edge_tts(
     )
 
 
+def _text_for_tts(s: str) -> str:
+    """
+    Turn LLM / markdown-ish text into speech-friendly plain text: no **stars**, no URLs
+    (avoids TTS spelling W-W-W or H-T-T-P-S), no link syntax, minimal list noise.
+    """
+    if not s:
+        return s
+    t = s.replace("\r\n", "\n")
+    # Images: ![alt](u) -> alt
+    t = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    # Links: [label](url) -> label
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    # Headers at line start
+    t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)
+    # Fenced code blocks: drop
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = re.sub(r"`+([^`]+)`+", r"\1", t)
+    # Bold / italic (repeat; handles simple nesting)
+    for _ in range(4):
+        t = re.sub(r"\*\*([^*]+?)\*\*", r"\1", t)
+        t = re.sub(r"__([^_]+?)__", r"\1", t)
+        t = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"\1", t)
+        t = re.sub(r"(?<!_)_([^_]+?)_(?!_)", r"\1", t)
+    # List / blockquote line prefixes
+    t = re.sub(r"(?m)^\s*>\s?", "", t)
+    t = re.sub(r"(?m)^\s*[-*+•]\s+", "", t)
+    t = re.sub(r"(?m)^\s*\d+\.\s+", "", t)
+    # Remaining URL-like strings (TTS may spell letter-by-letter)
+    t = re.sub(r"https?://[^\s)>\]]+", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bwww\.[^\s)>\]]+", " ", t, flags=re.IGNORECASE)
+    # Trailing * from truncated markdown
+    t = re.sub(r"\*+", " ", t)
+    t = t.replace("**", " ")
+    # Whitespace
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n+", ". ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+
+async def _speak_edge_clip(clip: str, voice: str) -> None:
+    """One Edge TTS request + play (blocking until audio finishes)."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        p = Path(f.name)
+    try:
+        communicate = _edge_tts(clip, voice)
+        await communicate.save(str(p))
+        play_mp3_path(p)
+    except edge_tts.exceptions.NoAudioReceived:
+        logger.warning("Edge TTS returned no audio for: %s", clip[:80])
+    except Exception as e:  # noqa: BLE001
+        logger.error("TTS error: %s", e)
+    finally:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _try_quick_intent(user_text: str) -> str | None:
+    """
+    Match simple open/close phrases and run Chrome tools without the LLM (~50ms vs round-trip).
+    Returns tool result string on success, None to fall back to think().
+    """
+    from jarvis_tools import close_all_google_chrome, open_url_in_chrome
+
+    tl = " ".join(user_text.lower().split())
+    rows: list[tuple[tuple[str, ...], Callable[[], str]]] = [
+        (
+            ("close chrome", "close browser", "shut chrome", "quit chrome"),
+            close_all_google_chrome,
+        ),
+        (
+            (
+                "open google chrome",
+                "google chrome",
+                "open chrome",
+                "chrome browser",
+                "open browser",
+                "launch chrome",
+            ),
+            lambda: open_url_in_chrome("https://www.google.com"),
+        ),
+        (
+            (
+                "open youtube",
+                "launch youtube",
+                "youtube.com",
+                "youtube",
+            ),
+            lambda: open_url_in_chrome("https://www.youtube.com"),
+        ),
+        (("spotify",), lambda: open_url_in_chrome("https://open.spotify.com")),
+        (("gmail", "open gmail"), lambda: open_url_in_chrome("https://mail.google.com")),
+        (
+            ("whatsapp", "whats app", "open whatsapp", "whatsap"),
+            lambda: open_url_in_chrome("https://web.whatsapp.com"),
+        ),
+        (("search google", "open google"), lambda: open_url_in_chrome("https://www.google.com")),
+        (("google",), lambda: open_url_in_chrome("https://www.google.com")),
+    ]
+    for keys, fn in rows:
+        if any(k in tl for k in keys):
+            try:
+                return str(fn())
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Quick intent tool failed, using LLM: %s", e)
+                return None
+    return None
+
+
+def _try_coding_lab_intent(user_text: str) -> str | None:
+    """
+    Match phrases like "setup lab" / "set up my coding environment" and prepare a folder
+    and VS Code without calling the LLM.
+    """
+    from jarvis_coding_lab import run_coding_lab
+
+    return run_coding_lab(user_text)
+
+
+def _build_ollama_tools() -> list[dict]:
+    """
+    Auto-generate Ollama/OpenAI JSON schema from JARVIS_TOOL_FUNCTIONS.
+    Reads function name, docstring (first line), and type-annotated parameters.
+    """
+    try:
+        from jarvis_tools import JARVIS_TOOL_FUNCTIONS
+    except ImportError:
+        return []
+
+    _PY_TO_JSON: dict[str, str] = {
+        "str": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+    }
+    tools: list[dict] = []
+    for fn in JARVIS_TOOL_FUNCTIONS:
+        if not callable(fn):
+            continue
+        try:
+            sig = inspect.signature(fn)
+        except (ValueError, TypeError):
+            continue
+        doc = (fn.__doc__ or fn.__name__).strip().split("\n")[0][:300]
+        props: dict[str, dict] = {}
+        required: list[str] = []
+        for pname, param in sig.parameters.items():
+            ann = param.annotation
+            ann_name = getattr(ann, "__name__", str(ann))
+            jtype = _PY_TO_JSON.get(ann_name, "string")
+            props[pname] = {"type": jtype, "description": pname}
+            if param.default is inspect.Parameter.empty:
+                required.append(pname)
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": fn.__name__,
+                    "description": doc,
+                    "parameters": {
+                        "type": "object",
+                        "properties": props,
+                        "required": required,
+                    },
+                },
+            }
+        )
+    return tools
+
+
+def _normalize_tool_arguments(raw: Any) -> dict:
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        return dict(raw)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _execute_ollama_tool(name: str, args: Any) -> str:
+    """Dispatch a tool call by function name, return string result."""
+    args = _normalize_tool_arguments(args)
+    try:
+        from jarvis_tools import JARVIS_TOOL_FUNCTIONS
+    except ImportError:
+        return "Error: jarvis_tools not available."
+    for fn in JARVIS_TOOL_FUNCTIONS:
+        if fn.__name__ == name:
+            try:
+                result = fn(**args)
+                return str(result)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Tool '%s' raised: %s", name, e)
+                return f"Tool error ({name}): {e}"
+    return f"Unknown tool: {name}"
+
+
 class Jarvis:
     def __init__(self, input_device: int | None) -> None:
         self._input_device = input_device
@@ -634,18 +824,13 @@ class Jarvis:
         from session_memory import SessionMemory
 
         self._session = SessionMemory()
-        self.stt_mode = STT_MODE
-        self.llm_mode = LLM_MODE
-
-        self._whisper: Any = None
-        self._vosk_model: Any = None
-        self._genai_client: Any = None
+        self._fw_model: Any = None  # faster-whisper model
+        self._stt_cpu_fallback_used = False  # True after auto-reload from broken CUDA runtime
 
     def _build_effective_system(self) -> str:
         s = SYSTEM_JARVIS
-        if JARVIS_ENABLE_TOOLS and self.llm_mode == "gemini":
-            if "you must use them when relevant" not in s:
-                s += _active_system_tools_addon()
+        if "you must use them when relevant" not in s:
+            s += _active_system_tools_addon()
         s += self._session.instruction_suffix()
         return s
 
@@ -654,114 +839,94 @@ class Jarvis:
             return
         self.chat.messages[0]["content"] = self._build_effective_system()
 
-    def _get_genai(self) -> Any:
-        if self._genai_client is None:
-            from google import genai
-
-            key = os.environ.get("GOOGLE_API_KEY")
-            if not key:
-                raise RuntimeError("GOOGLE_API_KEY is required for Gemini STT/LLM.")
-            self._genai_client = genai.Client(api_key=key)
-        return self._genai_client
-
     def load_stt(self) -> None:
-        if self.stt_mode == "whisper":
-            try:
-                import whisper
-            except ImportError as e:
-                raise RuntimeError(
-                    "Whisper STT needs torch. Run: uv sync --extra whisper"
-                ) from e
-            device = os.environ.get("JARVIS_WHISPER_DEVICE", "cpu")
-            logger.info(
-                "Loading openai-whisper %r on %s (first run downloads weights)…",
-                WHISPER_SIZE,
-                device,
-            )
-            self._whisper = whisper.load_model(WHISPER_SIZE, device=device)
-            logger.info("Whisper ready.")
-        elif self.stt_mode == "vosk":
-            from vosk import Model
+        from faster_whisper import WhisperModel
 
-            path = Path(JARVIS_VOSK_MODEL)
-            if not path.is_dir():
-                raise RuntimeError(
-                    f"Vosk model not found at {path}. "
-                    "Download e.g. vosk-model-small-en-us-0.15, unzip into ./models/, "
-                    "or set JARVIS_VOSK_MODEL. Or set JARVIS_STT=gemini with GOOGLE_API_KEY."
-                )
-            logger.info("Loading Vosk model from %s …", path)
-            self._vosk_model = Model(str(path))
-            logger.info("Vosk ready (fast local STT).")
-        elif self.stt_mode == "gemini":
-            self._get_genai()
-            logger.info("Gemini STT will use model %s (no local STT load).", GEMINI_STT_MODEL)
-        else:
-            raise ValueError(
-                f"Unknown JARVIS_STT={self.stt_mode!r}. Use: gemini, vosk, whisper"
-            )
+        logger.info(
+            "Loading faster-whisper model '%s' on %s (%s)...",
+            FW_MODEL_SIZE,
+            FW_DEVICE,
+            FW_COMPUTE,
+        )
+        self._fw_model = WhisperModel(
+            FW_MODEL_SIZE,
+            device=FW_DEVICE,
+            compute_type=FW_COMPUTE,
+        )
+        logger.info("faster-whisper ready.")
 
-    def transcribe(self, audio: np.ndarray) -> str:
-        if audio.size < SAMPLE_RATE * 0.2:
-            return ""
-        if self.stt_mode == "whisper":
-            return self._transcribe_whisper(audio)
-        if self.stt_mode == "vosk":
-            return self._transcribe_vosk(audio)
-        if self.stt_mode == "gemini":
-            return self._transcribe_gemini(audio)
-        return ""
+    def _reload_stt_on_cpu(self) -> None:
+        """Recover from missing CUDA/cuBLAS DLLs (common on Windows without full CUDA 12 runtime)."""
+        from faster_whisper import WhisperModel
 
-    def _transcribe_whisper(self, audio: np.ndarray) -> str:
-        if self._whisper is None:
-            return ""
-        use_cuda = os.environ.get("JARVIS_WHISPER_DEVICE", "cpu") == "cuda"
-        lang = os.environ.get("JARVIS_LANG")
-        r = self._whisper.transcribe(
-            audio,
-            language=lang if lang else None,
-            fp16=use_cuda,
+        logger.warning(
+            "Reloading faster-whisper on CPU (%s). "
+            "GPU failed: install CUDA 12.x + cuBLAS on PATH, or set JARVIS_FW_DEVICE=cpu in .env.",
+            FW_COMPUTE_CPU,
+        )
+        self._fw_model = WhisperModel(
+            FW_MODEL_SIZE,
+            device="cpu",
+            compute_type=FW_COMPUTE_CPU,
+        )
+        self._stt_cpu_fallback_used = True
+
+    def _transcribe_segments(self, audio_f32: np.ndarray):
+        return self._fw_model.transcribe(
+            audio_f32,
+            language="en",  # English only — faster
+            beam_size=5,
+            vad_filter=True,  # skip silence internally
             without_timestamps=True,
         )
-        return (r.get("text") or "").strip()
 
-    def _transcribe_vosk(self, audio: np.ndarray) -> str:
-        if self._vosk_model is None:
+    @staticmethod
+    def _is_cuda_runtime_error(exc: BaseException) -> bool:
+        s = str(exc).lower()
+        return any(
+            x in s
+            for x in (
+                "cublas",
+                "cudnn",
+                "cuda",
+                "nvrtc",
+                "dll",
+                "could not load",
+                "cannot load",
+            )
+        )
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        if audio.size < SAMPLE_RATE * 0.15 or self._fw_model is None:
             return ""
-        from vosk import KaldiRecognizer
-
-        rec = KaldiRecognizer(self._vosk_model, SAMPLE_RATE)
-        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-        chunk = 8000
-        for i in range(0, len(pcm), chunk):
-            rec.AcceptWaveform(pcm[i : i + chunk])
-        data = json.loads(rec.FinalResult())
-        return (data.get("text") or "").strip()
-
-    def _transcribe_gemini(self, audio: np.ndarray) -> str:
-        from google.genai import types
-
-        client = self._get_genai()
-        wav = float32_to_wav_bytes(audio, SAMPLE_RATE)
-        prompt = (
-            "Transcribe the speech in this audio. Output only the spoken words, "
-            "same language as the speaker, no labels or punctuation hints."
-        )
-        response = client.models.generate_content(
-            model=GEMINI_STT_MODEL,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                        types.Part.from_text(text=prompt),
-                    ],
-                )
-            ],
-        )
-        return (response.text or "").strip()
+        # faster-whisper needs float32 numpy array
+        audio_f32 = audio.astype(np.float32)
+        try:
+            segments, _ = self._transcribe_segments(audio_f32)
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+        except (RuntimeError, OSError) as e:
+            if (
+                not self._stt_cpu_fallback_used
+                and FW_DEVICE == "cuda"
+                and self._is_cuda_runtime_error(e)
+            ):
+                self._reload_stt_on_cpu()
+                segments, _ = self._transcribe_segments(audio_f32)
+                text = " ".join(seg.text.strip() for seg in segments).strip()
+            else:
+                raise
+        logger.info("STT: %s", text)
+        return text
 
     def think(self, user_text: str) -> str:
+        """
+        Ollama agentic loop with streaming + tool calling.
+
+        Flow:
+        1. Send messages + all tool schemas to Ollama
+        2. If model returns tool_calls → execute each tool → add result → repeat
+        3. If model returns plain text → return it (spoken reply)
+        """
         from session_memory import set_active_session
 
         set_active_session(self._session)
@@ -769,166 +934,130 @@ class Jarvis:
         self._sync_system_message()
         logger.info("User: %s", user_text)
         t0 = time.perf_counter()
-        if self.llm_mode == "gemini":
-            out = self._think_gemini()
+
+        tools = _build_ollama_tools()
+        # Working copy of messages for this turn (agentic loop may extend it)
+        messages = self.chat.openai_style_messages()
+
+        out = ""
+        for round_num in range(MAX_TOOL_ROUNDS):
+            try:
+                resp = ollama.chat(
+                    model=OLLAMA_MODEL,
+                    messages=messages,
+                    tools=tools if tools else None,
+                    stream=False,  # keep False for tool call reliability
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "Ollama error: %s — run: ollama serve && ollama pull %s",
+                    e,
+                    OLLAMA_MODEL,
+                )
+                self.chat.messages.pop()  # remove the user turn we added
+                return "Ollama is not responding. Please start Ollama and pull the model."
+
+            msg = resp.message
+            if msg is None:
+                self.chat.messages.pop()
+                return "Ollama returned an empty message."
+
+            # ── No tool calls → this is the final spoken reply ──
+            if not msg.tool_calls:
+                out = (msg.content or "").strip()
+                break
+
+            # ── Tool calls → execute and loop ──
+            logger.info("Round %d: %d tool call(s)", round_num + 1, len(msg.tool_calls))
+
+            # Add assistant tool-call message to working history
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": _normalize_tool_arguments(tc.function.arguments),
+                            }
+                        }
+                        for tc in msg.tool_calls
+                    ],
+                }
+            )
+
+            # Execute each tool, add results
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                fn_args = _normalize_tool_arguments(tc.function.arguments)
+                logger.info("  → %s(%s)", fn_name, fn_args)
+                result = _execute_ollama_tool(fn_name, fn_args)
+                logger.info("  ← %s", result[:200])
+                messages.append({"role": "tool", "content": result})
         else:
-            out = self._think_ollama()
+            out = "I've completed the requested actions, sir."
+
         t1 = time.perf_counter()
-        logger.info("Assistant (%d ms): %s", int((t1 - t0) * 1000), out[:200])
+        logger.info("LLM+tools (%d ms): %s", int((t1 - t0) * 1000), out[:200])
         if out:
             self.chat.add_assistant(out)
         return out
 
-    def _think_gemini(self) -> str:
-        from google.genai import types
-
-        def _pop_last_user() -> None:
-            if self.chat.messages and self.chat.messages[-1].get("role") == "user":
-                self.chat.messages.pop()
-
-        try:
-            client = self._get_genai()
-        except RuntimeError as e:
-            _pop_last_user()
-            return str(e)
-
-        system_inst: str | None = None
-        parts_contents: list[Any] = []
-        for m in self.chat.messages:
-            if m["role"] == "system":
-                system_inst = m["content"]
-            elif m["role"] == "user":
-                parts_contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=m["content"])],
-                    )
-                )
-            elif m["role"] == "assistant":
-                parts_contents.append(
-                    types.Content(
-                        role="model",
-                        parts=[types.Part.from_text(text=m["content"])],
-                    )
-                )
-
-        tools_arg: list | None = None
-        if JARVIS_ENABLE_TOOLS:
-            from jarvis_tools import JARVIS_TOOL_FUNCTIONS
-
-            tools_arg = list(JARVIS_TOOL_FUNCTIONS)
-        if system_inst is None:
-            system_inst = self._build_effective_system()
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=parts_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_inst,
-                    temperature=0.55,
-                    max_output_tokens=1500,
-                    tools=tools_arg,
-                ),
-            )
-        except Exception as e:
-            _pop_last_user()
-            logger.error("Gemini generate_content failed: %s", e)
-            return "I'm sorry, I could not complete that request."
-
-        out = (response.text or "").strip()
-        if not out and response.candidates:
-            cand = response.candidates[0]
-            if cand.content and cand.content.parts:
-                chunks: list[str] = []
-                for part in cand.content.parts:
-                    if getattr(part, "text", None):
-                        chunks.append(part.text)  # type: ignore[union-attr]
-                out = " ".join(chunks).strip()
-        return out
-
-    def _think_ollama(self) -> str:
-        try:
-            resp = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=self.chat.openai_style_messages(),
-            )
-        except Exception as e:
-            if self.chat.messages and self.chat.messages[-1].get("role") == "user":
-                self.chat.messages.pop()
-            logger.error(
-                "Ollama error: %s — is `ollama serve` running? Try: ollama pull %s",
-                e,
-                OLLAMA_MODEL,
-            )
-            return "I'm sorry, the language model is unavailable. Please start Ollama and pull the model."
-        return (resp.message.content or "").strip()
-
     async def speak(self, text: str) -> None:
+        """
+        Speak text via Edge TTS.
+        Normal-length replies are synthesized in **one** request to avoid long dead air
+        between sentence chunks (each chunk used to require a new round-trip to Edge).
+        Very long text is still split on sentence boundaries.
+        """
         if not text:
             return
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            p = Path(f.name)
-        try:
-            last_err: Exception | None = None
-            for voice in _edge_tts_voices_to_try(text):
-                try:
-                    c = _edge_tts(text, voice)
-                    await c.save(str(p))
-                    if voice != pick_edge_voice(text):
-                        logger.warning("Edge TTS used fallback voice %s (primary mismatch)", voice)
-                    play_mp3_path(p)
-                    last_err = None
-                    break
-                except edge_tts.exceptions.NoAudioReceived as e:
-                    last_err = e
-                    logger.warning("Edge TTS no audio with %s, trying next voice…", voice)
-                    continue
-            if last_err is not None:
-                raise last_err
-        finally:
-            try:
-                p.unlink(missing_ok=True)  # type: ignore[arg-type]
-            except OSError:
-                pass
+
+        text = _text_for_tts(text)
+        if not text:
+            return
+
+        voice = pick_edge_voice(text)
+
+        if len(text) <= JARVIS_TTS_SINGLE_MAX_CHARS:
+            await _speak_edge_clip(text, voice)
+            return
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        for sentence in sentences:
+            await _speak_edge_clip(sentence, voice)
 
     def run(self) -> None:
-        if self.llm_mode == "gemini" and not _HAS_GEMINI_KEY:
-            logger.error("JARVIS_LLM=gemini requires GOOGLE_API_KEY in the environment.")
-            return
-        if self.stt_mode == "gemini" and not _HAS_GEMINI_KEY:
-            logger.error("JARVIS_STT=gemini requires GOOGLE_API_KEY.")
-            return
-
         self.load_stt()
         if not pygame.mixer.get_init():
             pygame.mixer.init()
 
+        logger.info("Warming up Ollama model…")
+        try:
+            ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            logger.info("Ollama warm.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Ollama warmup failed — is ollama serve running? %s", e)
+
         from jarvis_tools import close_all_google_chrome
 
         logger.info(
-            "STT=%s LLM=%s | Gemini model=%s | tools=%s | TTS: voice=%s | rate=%s pitch=%s | JARVIS_TTS_LANG=%s (spoken English) | ADB: %s",
-            self.stt_mode,
-            self.llm_mode,
-            GEMINI_MODEL if self.llm_mode == "gemini" else "(n/a)",
-            "on" if (JARVIS_ENABLE_TOOLS and self.llm_mode == "gemini") else "off",
+            "STT=faster-whisper(%s) LLM=ollama(%s) TTS=edge | Tools=ON | GPU=%s",
+            FW_MODEL_SIZE,
+            OLLAMA_MODEL,
+            FW_DEVICE,
+        )
+        logger.info(
+            "TTS: voice=%s | rate=%s pitch=%s | JARVIS_TTS_LANG=%s (spoken output)",
             EDGE_VOICE,
             JARVIS_EDGE_RATE,
             JARVIS_EDGE_PITCH,
             JARVIS_TTS_LANG,
-            _adb_status_line(),
         )
-        if self.llm_mode == "ollama" and JARVIS_ENABLE_TOOLS:
-            logger.info("Note: JARVIS_ENABLE_TOOLS is set but tools only apply to Gemini (JARVIS_LLM=gemini).")
-        if JARVIS_ENABLE_TOOLS and self.llm_mode == "gemini":
-            try:
-                from jarvis_adb_tools import phone_tools_enabled
-
-                logger.info(
-                    "Phone ADB tools: %s (set JARVIS_ENABLE_PHONE_TOOLS=0 to disable).",
-                    "on" if phone_tools_enabled() else "off",
-                )
-            except ImportError:
-                pass
 
         wake_clap = _wake_on_clap_enabled()
         clap_sticky = _clap_sticky_enabled()
@@ -1015,6 +1144,40 @@ class Jarvis:
                     logger.info("Close Chrome: %s", cmsg)
                     asyncio.run(self.speak("All Chrome windows closed, sir."))
                     continue
+                lab_line = _try_coding_lab_intent(text)
+                if lab_line is not None:
+                    logger.info("Coding lab: %s", lab_line[:300])
+                    from session_memory import set_active_session
+
+                    set_active_session(self._session)
+                    self.chat.add_user(text)
+                    self._sync_system_message()
+                    self.chat.add_assistant(lab_line)
+                    asyncio.run(self.speak(lab_line))
+                    continue
+                qi = _try_quick_intent(text)
+                if qi is not None:
+                    logger.info("Quick intent matched: %s", qi[:200])
+                    from session_memory import set_active_session
+
+                    set_active_session(self._session)
+                    self.chat.add_user(text)
+                    self._sync_system_message()
+                    if any(
+                        p in text.lower()
+                        for p in (
+                            "close chrome",
+                            "close browser",
+                            "shut chrome",
+                            "quit chrome",
+                        )
+                    ):
+                        line = "Done, sir."
+                    else:
+                        line = "Opening it now, sir."
+                    self.chat.add_assistant(line)
+                    asyncio.run(self.speak(line))
+                    continue
                 reply = self.think(text)
                 asyncio.run(self.speak(reply))
             except KeyboardInterrupt:
@@ -1025,10 +1188,26 @@ class Jarvis:
                 logger.exception("Loop error: %s", e)
 
 
+def _quiet_third_party_loggers() -> None:
+    """Third-party libraries often log every HTTP request at INFO."""
+    for name in (
+        "httpx",
+        "httpcore",
+        "huggingface_hub",
+        "huggingface_hub.utils._http",
+        "fsspec",
+        "faster_whisper",
+        "primp",  # ddgs / web search
+        "ddgs",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    _quiet_third_party_loggers()
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("-d", "--input-device", type=int, default=None)
     p.add_argument("--list-devices", action="store_true")

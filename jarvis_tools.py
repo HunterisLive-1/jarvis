@@ -1,6 +1,5 @@
 """
-Python callables for Gemini automatic function calling (AFC).
-Used when JARVIS_ENABLE_TOOLS=1 and LLM is Gemini. Each function returns a string for the model.
+Tool callables for the voice assistant (Ollama tool calling). Each function returns a string.
 """
 
 from __future__ import annotations
@@ -449,7 +448,7 @@ def get_approximate_location() -> str:
     ]
     if coord:
         lines.append(f"Coordinates: {coord}.")
-    lines.append("This is network-level, not the phone's live GPS; suggest opening a map to confirm area.")
+    lines.append("This is network-level (IP), not live GPS; suggest opening a map to confirm the area.")
     return "\n".join(lines)
 
 
@@ -634,19 +633,6 @@ def chrome_tab_left() -> str:
         return f"Tab switch failed: {e!s}"
 
 
-# Android ADB (see jarvis_adb_tools.py) — opt out with JARVIS_ENABLE_PHONE_TOOLS=0
-def _load_adb_tool_functions() -> list:
-    try:
-        from jarvis_adb_tools import JARVIS_ADB_TOOL_FUNCTIONS, phone_tools_enabled
-
-        if not phone_tools_enabled():
-            return []
-        return list(JARVIS_ADB_TOOL_FUNCTIONS)
-    except ImportError as e:
-        logger.warning("jarvis_adb_tools unavailable: %s", e)
-        return []
-
-
 # Browser sequences (see jarvis_browser_routines.py) — world news + LiveUAMap, not user GPS
 def _load_browser_routine_tools() -> list:
     try:
@@ -678,7 +664,6 @@ JARVIS_TOOL_FUNCTIONS = [
     open_map_at_my_location,
     open_global_map,
     *(_load_browser_routine_tools()),
-    *(_load_adb_tool_functions()),
     open_url_in_chrome,
     close_all_google_chrome,
     focus_google_chrome,

@@ -1,26 +1,18 @@
 [project]
 name = "livrkit-agent"
-version = "0.1.0"
-description = "Jarvis AI Assistant by Hunter is Live: local PC voice (STT: Gemini / Vosk / Whisper) + LLM (Gemini / Ollama) + Edge TTS, optional ADB phone tools."
+version = "2.0.0"
+description = "Jarvis AI — fully local: faster-whisper STT + Ollama LLM + Edge TTS"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "python-dotenv>=1.2.2",
+    "faster-whisper>=1.0.0",
     "sounddevice>=0.5",
     "numpy>=1.26",
     "ollama>=0.3",
     "edge-tts>=7.0",
     "pygame>=2.5",
-    "google-genai>=1.0",
-    "vosk>=0.3.45",
-    "ddgs>=9.4",
     "pyautogui>=0.9.54",
     "pygetwindow>=0.0.9",
-]
-
-[project.optional-dependencies]
-# Heavy local STT (only if JARVIS_STT=whisper)
-whisper = [
-    "openai-whisper",
-    "torch",
+    "ddgs>=9.4",
+    "python-dotenv>=1.2.2",
 ]

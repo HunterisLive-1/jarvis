@@ -1,6 +1,6 @@
 # Jarvis AI Assistant by Hunter is Live
 
-A local, voice-driven assistant for your PC. Speak into the microphone; the app transcribes your speech, reasons with a large language model, and answers aloud with **Microsoft Edge TTS** (natural-sounding English by default). Optional **Gemini** tools can search the web, open Chrome, show maps and news, and—if you use Android **ADB**—control your phone.
+A local, low-latency voice assistant for your PC: **faster-whisper** (STT) → **Ollama** (LLM with tool calling) → **Microsoft Edge TTS** (English by default). **Jarvis tools** (web search, Chrome, maps, news) are registered for Ollama. No Google API key.
 
 This repository is intended to be **open source**. You are welcome to use it, change it, and share it under the license you add to the project (e.g. MIT). Do **not** commit API keys or personal secrets; use environment files that stay on your machine (see below).
 
@@ -12,12 +12,11 @@ This repository is intended to be **open source**. You are welcome to use it, ch
 
 | Area | What it does |
 |------|----------------|
-| **Pipeline** | Microphone → **STT** (speech-to-text) → **LLM** → **TTS** (text-to-speech) |
-| **STT** | **Gemini** (cloud, needs API key), **Vosk** (local, fast CPU), or **Whisper** (local, optional heavy install) |
-| **LLM** | **Google Gemini** (with tools) or **Ollama** (fully local; tools only work with Gemini) |
+| **Pipeline** | Microphone → **faster-whisper** → **Ollama** (tools) → **Edge TTS** |
+| **STT** | **faster-whisper** (local; CUDA recommended — `JARVIS_FW_*`) |
+| **LLM** | **Ollama** with tool calling — `JARVIS_OLLAMA_MODEL` (default `qwen2.5:3b`) |
 | **TTS** | **Edge TTS** — voice, rate, pitch, volume configurable via environment variables |
-| **Tools (Gemini)** | Web search, headlines, open URLs in Chrome, tiled “briefing” windows (e.g. LiveUAMap + world news), location-from-IP, and more |
-| **Phone (optional)** | **ADB**: check device, wireless ADB, open WhatsApp / YouTube, search YouTube on the phone — see [Android and ADB](#android-and-adb) |
+| **Tools** | Web search, headlines, open URLs in Chrome, tiled “briefing” windows (e.g. LiveUAMap + world news), location-from-IP, and more — via Ollama |
 | **Wake on clap** | Optional: clap (or double-clap) to wake, then keep talking until you say you’re done — see [Clap wake](#clap-wake) |
 
 > **Note:** Some desktop automation (Chrome window tiling, etc.) is written with **Windows** in mind. Core voice + Ollama may run on other platforms, but you may need to adjust paths and window commands.
@@ -26,14 +25,86 @@ This repository is intended to be **open source**. You are welcome to use it, ch
 
 ## Requirements
 
-- **Python 3.10+**
+- **Python 3.11+** (3.10 is not supported by current `faster-whisper` / `onnxruntime` wheels on some platforms)
 - A **microphone** and **speakers** (or headphones)
 - **[uv](https://github.com/astral-sh/uv)** (recommended) *or* `pip` + a virtual environment
-- For **Gemini** STT/LLM: a **[Google AI API key](https://aistudio.google.com/apikey)** (`GOOGLE_API_KEY`)
-- For **Ollama**: [Ollama](https://ollama.com/) installed, `ollama serve` running, and a pulled model (e.g. `ollama pull llama3.2:3b`)
-- For **optional Whisper STT**: extra install — `uv sync --extra whisper` (large PyTorch download)
+- **GPU (optional)**: for STT, set `JARVIS_FW_DEVICE=cuda` and install a working CUDA stack for [faster-whisper](https://github.com/SYSTRAN/faster-whisper) / [ctranslate2](https://github.com/OpenNMT/CTranslate2) (or use `cpu` and `JARVIS_FW_COMPUTE=int8`)
+- **[Ollama](https://ollama.com/)** installed, `ollama serve` running, and a pulled model (e.g. `ollama pull qwen2.5:3b`) matching `JARVIS_OLLAMA_MODEL`
 
 ---
+
+## One-time setup (fully local)
+
+```bash
+# 1. Install Ollama + pull model
+winget install Ollama.Ollama
+ollama pull qwen2.5:3b
+
+# 2. Install Python deps (uv)
+uv sync
+
+# 3. Run
+uv run python local_jarvis.py
+```
+
+On non-Windows, install Ollama from [ollama.com](https://ollama.com/) and run the same `ollama pull` / `uv sync` / `uv run` steps.
+
+---
+
+## From zero: complete setup (for a new person)
+
+Use this on a **Windows** PC; adjust `winget` / paths on Linux or macOS (install **Git**, **Python 3.11+**, **uv**, and **Ollama** from your package manager or official sites).
+
+1. **Install Git (to clone the repo)**  
+   - Windows: [git-scm.com](https://git-scm.com/download/win) *or* `winget install Git.Git`  
+   - Verify: `git --version`
+
+2. **Install Python 3.11+** (required by the project)  
+   - Windows: [python.org](https://www.python.org/downloads/) and enable **“Add python.exe to PATH”** *or* `winget install Python.Python.3.12`  
+   - Verify: `python --version` (should be 3.11 or newer)
+
+3. **Install [uv](https://docs.astral.sh/uv/)** (manages the virtual environment and runs the app)  
+   - `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (PowerShell) *or* `pip install uv`  
+   - Verify: `uv --version`
+
+4. **Install Ollama** (local LLM server)  
+   - Windows: `winget install Ollama.Ollama` *or* download from [ollama.com](https://ollama.com/)  
+   - After install, Ollama usually runs in the background. Verify: `ollama --version`  
+   - **Pull a model** (must match or sit under your config, default is `qwen2.5:3b`):  
+     `ollama pull qwen2.5:3b`
+
+5. **Install Google Chrome** (optional but used by “open in Chrome” / map / news tools)  
+   - [google.com/chrome](https://www.google.com/chrome/) *or* `winget install Google.Chrome`  
+
+6. **Install Visual Studio Code** (optional; for voice **coding lab** — “set up my lab” opens a folder in VS Code)  
+   - [code.visualstudio.com](https://code.visualstudio.com/) and enable **“Add to PATH”** *or* set `JARVIS_VSCODE_PATH` in `.env.local` to your `code.cmd` path  
+
+7. **Clone this repository and enter the folder**  
+   ```bash
+   git clone https://github.com/HunterisLive-1/jarvis.git
+   cd jarvis
+   ```
+
+8. **Create your local environment file** (not committed; keeps your choices private)  
+   ```bash
+   copy .env.example .env.local
+   ```
+   - Edit **`.env.local`** if needed: e.g. `JARVIS_FW_DEVICE=cpu` if you have no GPU, `JARVIS_OLLAMA_MODEL=qwen2.5:3b` to match what you pulled.  
+
+9. **Install Python dependencies (creates/uses a project venv via uv)**  
+   ```bash
+   uv sync
+   ```
+
+10. **Run Jarvis**  
+    ```bash
+    uv run python local_jarvis.py
+    ```
+    - If the model name in `.env.local` does not match a pulled Ollama model, fix `JARVIS_OLLAMA_MODEL` or run `ollama pull <name>`.  
+    - Stop with **Ctrl+C**.  
+    - Wrong microphone: `uv run python local_jarvis.py --list-devices` then `uv run python local_jarvis.py --input-device N`  
+
+**Hardware / OS summary:** microphone and speakers/headphones; **GPU optional** for faster STT (CUDA) — otherwise set CPU + int8 in `.env.local` as in [Troubleshooting](#troubleshooting).
 
 ## Quick start
 
@@ -52,36 +123,22 @@ With **uv**:
 uv sync
 ```
 
-For **Whisper** (optional):
+### 3. Optional: environment
 
-```bash
-uv sync --extra whisper
-```
-
-### 3. Set your API key (Gemini)
-
-Create a file named **`.env.local`** or **`.env`** in the project root (same folder as `local_jarvis.py`). The app loads it on startup. Example:
-
-```env
-GOOGLE_API_KEY=your_key_here
-```
-
-**Never** commit this file. It is already listed in `.gitignore`.
-
-If you do not set `GOOGLE_API_KEY`, you must use local STT/LLM modes instead (Vosk/Whisper + Ollama) — see [Configuration](#configuration).
+Copy **`.env.example`** to **`.env`** or **`.env.local`** and adjust voices, Ollama model, or `JARVIS_FW_DEVICE` (`cuda` / `cpu`). The app loads `.env.local` first, then `.env`. **Never** commit secrets.
 
 ### 4. Run Jarvis
 
 ```bash
-uv run local_jarvis.py
+uv run python local_jarvis.py
 ```
 
 - Use **`Ctrl+C`** in the terminal to stop.
 - To pick a different audio input, list devices, then pass the index:
 
 ```bash
-uv run local_jarvis.py --list-devices
-uv run local_jarvis.py --input-device 1
+uv run python local_jarvis.py --list-devices
+uv run python local_jarvis.py --input-device 1
 ```
 
 ---
@@ -103,52 +160,36 @@ Environment variables and `.env` / `.env.local` still apply; the flags above ove
 
 Settings are read from the environment. The project loads **`.env.local` first, then `.env`**, and only sets variables that are **not** already in the process environment.
 
-### Core modes
+### Core pipeline
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JARVIS_STT` | `gemini` if `GOOGLE_API_KEY` is set, else `vosk` | `gemini`, `vosk`, or `whisper` |
-| `JARVIS_LLM` | `gemini` if key set, else `ollama` | `gemini` or `ollama` |
-| `JARVIS_GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model for chat (and default STT model unless overridden) |
-| `JARVIS_GEMINI_STT_MODEL` | same as `JARVIS_GEMINI_MODEL` | Model used for Gemini speech-to-text |
-| `JARVIS_OLLAMA_MODEL` | `llama3.2:3b` | Ollama model name when `JARVIS_LLM=ollama` |
-| `JARVIS_VOSK_MODEL` | (bundled default path) | Path to a [Vosk](https://alphacephei.com/vosk/) model directory |
-| `JARVIS_WHISPER` | `tiny` | Whisper size when `JARVIS_STT=whisper` |
-| `JARVIS_WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` for Whisper |
+| `JARVIS_FW_MODEL` | `base.en` | faster-whisper size (`tiny.en`, `base.en`, `small.en`, …) |
+| `JARVIS_FW_DEVICE` | `cuda` | `cuda` or `cpu` for STT |
+| `JARVIS_FW_COMPUTE` | `float16` | `float16` or `int8` for GPU |
+| `JARVIS_FW_COMPUTE_CPU` | `int8` | CPU compute type and after a GPU→CPU fallback |
+| `JARVIS_OLLAMA_MODEL` | `qwen2.5:3b` | Ollama model name (must be pulled, e.g. `ollama pull qwen2.5:3b`) |
 
 ### Tools and session
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JARVIS_ENABLE_TOOLS` | `1` | `1` / `0` — Gemini function calling (web, Chrome, maps, etc.) |
 | `JARVIS_MAX_TURNS` | `12` | How many user/assistant pairs are kept in context |
-| `JARVIS_SESSION_MAX_NOTES` | `12` | Short in-memory “session notes” from tools (e.g. ADB status) |
+| `JARVIS_SESSION_MAX_NOTES` | `12` | Short in-memory “session notes” from tools |
 | `JARVIS_SYSTEM` | *(built-in Jarvis-style prompt)* | Override the system instruction entirely |
 
-**Tools require** `JARVIS_LLM=gemini` and a valid `GOOGLE_API_KEY`. With Ollama, tool registration is not used.
-
-### Android / phone
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JARVIS_ENABLE_PHONE_TOOLS` | `1` | `0` to disable all phone ADB tools in Gemini |
-| `JARVIS_ADB_WIFI_IP` | *(unset)* | Phone LAN IP if the app cannot read Wi-Fi IP from the device (e.g. `192.168.1.50`) |
-| `JARVIS_PHONE_WIFI_IP` | — | Same purpose as `JARVIS_ADB_WIFI_IP` |
-| `ADB_PATH` | — | Full path to `adb.exe` if not using project or PATH |
-| `ADB_SERIAL` | — | `adb devices` id when more than one device is connected |
-| `JARVIS_WHATSAPP_PACKAGE` | `com.whatsapp` | Adjust for WhatsApp Business or OEM builds |
-| `JARVIS_WIRELESS_FOLLOWUP_ASK_YT` | `1` | After successful wireless ADB, prompt can suggest opening YouTube on the phone |
-| `JARVIS_WIRELESS_FOLLOWUP_YT_QUERY` | `Knife Bros Danda Noliwala` | Default search string for that follow-up (customize freely) |
+Tool functions registered for Ollama include web search, news, maps, and Chrome. Common phrases (e.g. “open YouTube”) can bypass the LLM for faster response. **Ollama** is warmed with a short chat at startup.
 
 ### TTS (Edge)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JARVIS_EDGE_VOICE` | `en-GB-RyanNeural` | Primary English voice |
+| `JARVIS_EDGE_VOICE` | `en-GB-ThomasNeural` | Primary English voice (UK male; Jarvis-like). Alternatives: `en-GB-RyanNeural`, `en-US-ChristopherNeural` |
 | `JARVIS_TTS_LANG` | `en` | Spoken language mode; `en` uses `JARVIS_EDGE_VOICE` |
-| `JARVIS_EDGE_RATE` | `+20%` | Speaking rate |
-| `JARVIS_EDGE_PITCH` | `+6Hz` | Pitch |
+| `JARVIS_EDGE_RATE` | `+10%` | Speaking rate |
+| `JARVIS_EDGE_PITCH` | `+2Hz` | Pitch |
 | `JARVIS_EDGE_VOLUME` | `+0%` | Volume |
+| `JARVIS_TTS_SINGLE_MAX_CHARS` | `4000` | Replies this short (after cleanup) are spoken in **one** Edge request; avoids long gaps between lines |
 | `JARVIS_WELCOME_EN` | *(built-in)* | First spoken line when the session starts |
 | `JARVIS_EDGE_VOICE_AR` | `fa-IR-FaridNeural` | Optional voice when using Arabic / mixed settings |
 
@@ -156,7 +197,7 @@ Settings are read from the environment. The project loads **`.env.local` first, 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JARVIS_WAKE_ON_CLAP` | `0` | `1` to require a clap before listening (or use `uv run local_jarvis.py --clap`) |
+| `JARVIS_WAKE_ON_CLAP` | `0` | `1` to require a clap before listening (or use `uv run python local_jarvis.py --clap`) |
 | `JARVIS_CLAP_STICKY_SESSION` | `1` | `1` = after clap, keep listening for more commands until “sleep” |
 | `JARVIS_CLAP_STRIKES` | `1` | `2` for double-clap to wake |
 | `JARVIS_CLAP_RMS` / `JARVIS_CLAP_PEAK` | *(tuned defaults)* | Raise if the mic triggers too easily |
@@ -182,30 +223,16 @@ Settings are read from the environment. The project loads **`.env.local` first, 
 | `JARVIS_CHROME_TILE` | `1` | Tiled multi-window layout for map + news |
 | `JARVIS_WORLD_NEWS_URL` | *(BBC default in code)* | World news page for `jarvis_browser_routines` |
 
----
+### Coding lab (no LLM)
 
-## Android and ADB
+Say e.g. **“set up my lab”** or **“prepare my coding environment”** (optionally with a path, a quoted path, or **“on desktop *folder name*”**). This creates a project folder, optional `.venv`, and opens **VS Code** — it does **not** call Ollama.
 
-1. On the phone: enable **Developer options** → **USB debugging**. Accept the computer’s RSA prompt when you plug in USB.
-2. Fetch **platform-tools** into the project (so `android_adb` can find `platform-tools\adb.exe` on Windows):
-
-   ```bash
-   uv run python scripts/fetch_platform_tools.py
-   ```
-
-   Or install Google [platform-tools](https://developer.android.com/studio/releases/platform-tools) and put `adb` on your `PATH`, or set `ADB_PATH` to the full path of `adb.exe`.
-
-3. Optional: set **`JARVIS_ADB_WIFI_IP`** to your phone’s **LAN** address if wireless setup cannot read the IP from the device. Phone and PC must be on the **same Wi-Fi** for wireless ADB.
-
-Jarvis can run tools such as `phone_check_adb_and_devices`, `phone_enable_wireless_adb`, `phone_open_youtube`, and `phone_youtube_search_and_open` when `JARVIS_ENABLE_PHONE_TOOLS=1` and the LLM is Gemini.
-
-**Standalone CLI (no voice):** for quick checks you can also run:
-
-```bash
-uv run phone_adb_control.py --help
-uv run phone_adb_control.py devices
-uv run phone_adb_control.py wireless --port 5555
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JARVIS_LAB_BASE` | `~/code` (under your user profile) | Base when you give a *name* only (e.g. `named myproject`) |
+| `JARVIS_LAB_DEFAULT_NAME` | `python-lab` | Folder when you only say “set up my lab” with no other hint |
+| `JARVIS_LAB_VENV` | `1` | `0` to skip creating `.venv` |
+| `JARVIS_VSCODE_PATH` | *(search PATH + common installs)* | Full path to `code.cmd` if `code` is not on `PATH` |
 
 ---
 
@@ -213,22 +240,18 @@ uv run phone_adb_control.py wireless --port 5555
 
 | Problem | What to try |
 |--------|-------------|
-| **No sound / wrong mic** | `uv run local_jarvis.py --list-devices` and `--input-device` |
-| **Gemini errors** | Confirm `GOOGLE_API_KEY` in `.env.local`, billing/API access, and model name |
-| **“Tools” not working** | Use `JARVIS_LLM=gemini` and `JARVIS_ENABLE_TOOLS=1` |
+| **No sound / wrong mic** | `uv run python local_jarvis.py --list-devices` and `--input-device` |
+| **STT / CUDA** (`cublas64_12.dll`, etc.) | Jarvis will **auto-fallback to CPU** once. For native GPU, install a **full CUDA 12** runtime (cuBLAS on `PATH`) matching CTranslate2, or set `JARVIS_FW_DEVICE=cpu` and `JARVIS_FW_COMPUTE_CPU=int8` |
 | **Clap too sensitive or deaf** | Adjust `JARVIS_CLAP_RMS`, `JARVIS_CLAP_PEAK`, or use `JARVIS_CLAP_DEBUG=1` |
 | **Ollama errors** | Run `ollama serve` and `ollama pull <model>`; match `JARVIS_OLLAMA_MODEL` |
-| **Vosk missing** | Download a model from Vosk and set `JARVIS_VOSK_MODEL` to the folder path, or switch to `JARVIS_STT=gemini` with an API key |
-| **ADB / phone** | `uv run phone_adb_control.py devices`, USB cable, authorization on phone, or `JARVIS_ADB_WIFI_IP` for Wi-Fi |
-| **Whisper too slow** | Smaller `JARVIS_WHISPER` model, or `JARVIS_WHISPER_DEVICE=cuda` with a GPU |
+| **Slower STT** | Smaller `JARVIS_FW_MODEL` (e.g. `tiny.en`) or use CPU int8 for lighter load |
 
 ---
 
 ## Privacy and security
 
-- **Gemini** sends audio and text to Google’s APIs; read Google’s terms and privacy policy for your use case.
 - **Edge TTS** uses Microsoft’s service for synthesis.
-- **Ollama** and **Vosk/Whisper** can keep inference local if you do not use Gemini.
+- **Ollama** and **faster-whisper** keep STT/LLM inference on your machine (no cloud LLM in the default stack).
 - **Web search and browsing tools** use your network; only enable tools you are comfortable with.
 - Never share `.env` / `.env.local` or commit them to git.
 
@@ -239,13 +262,10 @@ uv run phone_adb_control.py wireless --port 5555
 | File / folder | Role |
 |---------------|------|
 | `local_jarvis.py` | Main entry: record, transcribe, LLM, TTS loop |
-| `jarvis_tools.py` | Gemini tool functions (search, Chrome, maps, ADB registration) |
+| `jarvis_tools.py` | Tool functions (search, Chrome, maps, news) for Ollama |
+| `jarvis_coding_lab.py` | Voice “coding lab” setup (folder + venv + VS Code; no LLM) |
 | `jarvis_browser_routines.py` | LiveUAMap + world news in Chrome |
-| `jarvis_adb_tools.py` | Phone-related tool wrappers for Gemini |
-| `android_adb.py` | ADB helpers (wireless, WhatsApp, YouTube, shell) |
 | `session_memory.py` | Short rolling memory for tool results |
-| `phone_adb_control.py` | Optional CLI for ADB without the voice app |
-| `scripts/fetch_platform_tools.py` | Download Android platform-tools into `platform-tools/` |
 | `pyproject.toml` / `uv.lock` | Dependencies; PyPI-style name is `livrkit-agent`, while the GitHub repo is [**HunterisLive-1/jarvis**](https://github.com/HunterisLive-1/jarvis) |
 
 ---
@@ -255,7 +275,7 @@ uv run phone_adb_control.py wireless --port 5555
 Contributions, issues, and pull requests are welcome. Suggested first steps for contributors:
 
 1. Fork [HunterisLive-1/jarvis](https://github.com/HunterisLive-1/jarvis) and create a branch for your change.
-2. Run the app with `uv run local_jarvis.py` and, if you change tools, test with `JARVIS_LLM=gemini` and tools enabled.
+2. Run the app with `uv run python local_jarvis.py` and, if you change tools, test with a running Ollama server and a pulled model.
 3. Do not commit secrets; use `.env.local` locally.
 4. Add a **LICENSE** file (e.g. MIT) if the maintainer has not already done so, and state it clearly in the repo.
 
@@ -265,7 +285,7 @@ Contributions, issues, and pull requests are welcome. Suggested first steps for 
 
 **Jarvis AI Assistant by Hunter is Live.**
 
-Thanks to the open-source projects this stack builds on, including [Google Gemini](https://ai.google.dev/), [Ollama](https://ollama.com/), [Vosk](https://alphacephei.com/vosk/), [Edge TTS](https://github.com/rany2/edge-tts), [ddgs](https://github.com/deedy5/duckduckgo_search), and the broader Python ecosystem.
+Thanks to the open-source projects this stack builds on, including [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [Ollama](https://ollama.com/), [Edge TTS](https://github.com/rany2/edge-tts), [ddgs](https://github.com/deedy5/duckduckgo_search), and the broader Python ecosystem.
 
 If this project helps you, consider [starring the repository on GitHub](https://github.com/HunterisLive-1/jarvis) and sharing feedback.
 
