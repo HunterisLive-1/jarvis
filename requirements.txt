@@ -1,0 +1,7 @@
+# in dono me se koi ek command sirf ek baar run kardo sab install ho jayga
+#pip install google-genai pyaudio python-dotenv
+#pip install -r requirements.txt
+
+google-genai
+PyAudio
+python-dotenv
